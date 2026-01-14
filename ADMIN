@@ -1,0 +1,1179 @@
+-- Roblox LocalScript: Pet Dialog Spawner (FIXED FOR ALL EXECUTORS)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Thread identity helper for different executors
+local function set_thread_identity(level)
+if type(syn) == "table" and syn.set_thread_identity then
+return syn.set_thread_identity(level)
+elseif type(getthreadidentity) == "function" and type(setthreadidentity) == "function" then
+local current = getthreadidentity()
+setthreadidentity(level)
+return current
+elseif type(getthreadcontext) == "function" and type(setthreadcontext) == "function" then
+local current = getthreadcontext()
+setthreadcontext(level)
+return current
+end
+return 2 -- Default to 2 if no identity functions
+end
+
+-- Pet names list (capitalized properly)
+local petNames = {
+"Bat Dragon", "Shadow Dragon", "Evil Unicorn", "Crow", "Giraffe", 
+"Parrot", "Diamond Butterfly", "Owl", "Frost Dragon", "Giant Panda", 
+"Balloon Unicorn", "Monkey King", "Arctic Reindeer", "Hedgehog", "Flamingo",
+"Turtle", "Kangaroo"
+}
+
+-- === GLOBAL SPAWNER SYSTEM ===
+local spawnerSystemLoaded = false
+local spawnerPets = {}
+local equippedPet = nil
+local mountedPet = nil
+local currentMountTrack = nil
+
+-- Make these functions global so they can be called from dialog
+_G.createPet = nil
+_G.equipPet = nil
+_G.unequipPet = nil
+
+-- === SPAWNER SYSTEM ===
+local function loadSpawnerSystem()
+if spawnerSystemLoaded then return end
+
+local success, err = pcall(function()
+local oldIdentity = set_thread_identity(2)
+local Fsys = require(game.ReplicatedStorage:WaitForChild('Fsys'))
+local load = Fsys.load
+
+local clientData = load('ClientData')
+local items = load('KindDB')
+local router = load('RouterClient')
+local downloader = load('DownloadClient')
+local animationManager = load('AnimationManager')
+local petRigs = load('new:PetRigs')
+local UIManager = load('UIManager')
+
+set_thread_identity(oldIdentity)
+
+local petModels = {}
+
+local function updateData(key, action)
+local oldId = set_thread_identity(2)
+local data = clientData.get(key)
+local clonedData = table.clone(data)
+clientData.predict(key, action(clonedData))
+set_thread_identity(oldId)
+end
+
+local function getUniqueId()
+return HttpService:GenerateGUID(false)
+end
+
+local function getPetModel(kind)
+if petModels[kind] then
+return petModels[kind]:Clone()
+end
+
+local promise = downloader.promise_download_copy('Pets', kind)
+if promise then
+local streamed = promise:expect()
+petModels[kind] = streamed
+return streamed:Clone()
+end
+return nil
+end
+
+-- === PET CREATION ===
+_G.createPet = function(id, properties)
+local uniqueId = getUniqueId()
+local item = items[id]
+if not item then
+return nil
+end
+
+local oldId = set_thread_identity(2)
+local new_pet = {
+unique = uniqueId,
+category = 'pets',
+id = id,
+kind = item.kind,
+newness_order = math.random(1, 900000),
+properties = properties or {},
+}
+local inventory = clientData.get('inventory')
+inventory.pets[uniqueId] = new_pet
+set_thread_identity(oldId)
+
+spawnerPets[uniqueId] = {
+data = new_pet,
+model = nil,
+}
+
+return new_pet
+end
+
+local function neonify(model, entry)
+local petModel = model:FindFirstChild('PetModel')
+if not petModel then
+return
+end
+
+local oldId = set_thread_identity(2)
+local petRig = petRigs.get(petModel)
+set_thread_identity(oldId)
+
+if petRig and petRig.get_geo_part then
+for neonPart, configuration in pairs(entry.neon_parts) do
+local trueNeonPart = petRig.get_geo_part(petModel, neonPart)
+if trueNeonPart then
+trueNeonPart.Material = configuration.Material
+trueNeonPart.Color = configuration.Color
+end
+end
+end
+end
+
+local function addPetWrapper(wrapper)
+updateData('pet_char_wrappers', function(petWrappers)
+wrapper.unique = #petWrappers + 1
+wrapper.index = #petWrappers + 1
+petWrappers[#petWrappers + 1] = wrapper
+return petWrappers
+end)
+end
+
+local function addPetState(state)
+updateData('pet_state_managers', function(petStates)
+petStates[#petStates + 1] = state
+return petStates
+end)
+end
+
+local function findIndex(array, finder)
+for index, value in pairs(array) do
+local isIt = finder(value, index)
+if isIt then
+return index
+end
+end
+return nil
+end
+
+local function removePetWrapper(uniqueId)
+updateData('pet_char_wrappers', function(petWrappers)
+local index = findIndex(petWrappers, function(wrapper)
+return wrapper.pet_unique == uniqueId
+end)
+
+if not index then
+return petWrappers
+end
+
+table.remove(petWrappers, index)
+
+for wrapperIndex, wrapper in pairs(petWrappers) do
+wrapper.unique = wrapperIndex
+wrapper.index = wrapperIndex
+end
+
+return petWrappers
+end)
+end
+
+local function removePetState(uniqueId)
+local pet = spawnerPets[uniqueId]
+if not pet or not pet.model then
+return
+end
+
+updateData('pet_state_managers', function(petStates)
+local index = findIndex(petStates, function(state)
+return state.char == pet.model
+end)
+
+if not index then
+return petStates
+end
+
+table.remove(petStates, index)
+return petStates
+end)
+end
+
+-- === EQUIP/UNEQUIP SYSTEM ===
+_G.unequipPet = function(item)
+local pet = spawnerPets[item.unique]
+if not pet then 
+return 
+end
+
+removePetWrapper(item.unique)
+removePetState(item.unique)
+
+if pet.model then
+pet.model:Destroy()
+pet.model = nil
+end
+
+equippedPet = nil
+end
+
+_G.equipPet = function(item)
+if equippedPet then
+_G.unequipPet(equippedPet)
+end
+
+local petModel = getPetModel(item.kind)
+if not petModel then
+return
+end
+
+petModel.Parent = workspace
+spawnerPets[item.unique].model = petModel
+
+if item.properties.neon or item.properties.mega_neon then
+neonify(petModel, items[item.kind])
+end
+
+equippedPet = item
+
+local wrapper = {
+char = petModel,
+mega_neon = item.properties.mega_neon,
+neon = item.properties.neon,
+player = LocalPlayer,
+entity_controller = LocalPlayer,
+controller = LocalPlayer,
+rp_name = item.properties.rp_name or '',
+pet_trick_level = item.properties.pet_trick_level,
+pet_unique = item.unique,
+pet_id = item.id,
+location = {
+full_destination_id = 'housing',
+destination_id = 'housing',
+house_owner = LocalPlayer,
+},
+pet_progression = {
+age = math.random(1, 900000),
+percentage = math.random(0.01, 0.99),
+},
+are_colors_sealed = false,
+is_pet = true,
+}
+
+addPetWrapper(wrapper)
+
+addPetState({
+char = petModel,
+player = LocalPlayer,
+store_key = 'pet_state_managers',
+is_sitting = false,
+chars_connected_to_me = {},
+states = {},
+})
+end
+
+-- Helper function to get pet by name
+local InventoryDB = load('InventoryDB')
+_G.GetPetByName = function(name)
+local oldId = set_thread_identity(2)
+for i, v in pairs(InventoryDB.pets) do
+if v.name:lower() == name:lower() then
+set_thread_identity(oldId)
+return v.id
+end
+end
+set_thread_identity(oldId)
+return false
+end
+
+-- ROUTER.GET OVERRIDE
+local oldGet = router.get
+
+local function createRemoteFunctionMock(callback)
+return {
+InvokeServer = function(_, ...)
+return callback(...)
+end,
+}
+end
+
+local function createRemoteEventMock(callback)
+return {
+FireServer = function(_, ...)
+return callback(...)
+end,
+}
+end
+
+-- Helper functions for mounting
+local function clearPetState(uniqueId)
+local pet = spawnerPets[uniqueId]
+if not pet or not pet.model then return end
+
+updateData('pet_state_managers', function(states)
+local index = findIndex(states, function(state)
+return state.char == pet.model
+end)
+if not index then return states end
+
+local clonedStates = table.clone(states)
+clonedStates[index] = table.clone(clonedStates[index])
+clonedStates[index].states = {}
+return clonedStates
+end)
+end
+
+local function setPetState(uniqueId, id)
+local pet = spawnerPets[uniqueId]
+if not pet or not pet.model then return end
+
+updateData('pet_state_managers', function(states)
+local index = findIndex(states, function(state)
+return state.char == pet.model
+end)
+if not index then return states end
+
+local clonedStates = table.clone(states)
+clonedStates[index] = table.clone(clonedStates[index])
+clonedStates[index].states = {{ id = id }}
+return clonedStates
+end)
+end
+
+local function attachPlayerToPet(pet)
+local character = LocalPlayer.Character
+if not character or not character.PrimaryPart then return false end
+
+local ridePosition = pet:FindFirstChild('RidePosition', true)
+if not ridePosition then return false end
+
+local sourceAttachment = Instance.new('Attachment')
+sourceAttachment.Parent = ridePosition
+sourceAttachment.Position = Vector3.new(0, 1.237, 0)
+sourceAttachment.Name = 'SourceAttachment'
+
+local stateConnection = Instance.new('RigidConstraint')
+stateConnection.Name = 'StateConnection'
+stateConnection.Attachment0 = sourceAttachment
+stateConnection.Attachment1 = character.PrimaryPart.RootAttachment
+stateConnection.Parent = character
+
+return true
+end
+
+local function clearPlayerState()
+updateData('state_manager', function(state)
+local clonedState = table.clone(state)
+clonedState.states = {}
+clonedState.is_sitting = false
+return clonedState
+end)
+end
+
+local function setPlayerState(id)
+updateData('state_manager', function(state)
+local clonedState = table.clone(state)
+clonedState.states = {{ id = id }}
+clonedState.is_sitting = true
+return clonedState
+end)
+end
+
+local function unmount(uniqueId)
+local pet = spawnerPets[uniqueId]
+if not pet or not pet.model then return end
+
+if currentMountTrack then
+currentMountTrack:Stop()
+currentMountTrack:Destroy()
+end
+
+local sourceAttachment = pet.model:FindFirstChild('SourceAttachment', true)
+if sourceAttachment then
+sourceAttachment:Destroy()
+end
+
+if LocalPlayer.Character then
+for _, descendant in pairs(LocalPlayer.Character:GetDescendants()) do
+if descendant:IsA('BasePart') and descendant:GetAttribute('HaveMass') then
+descendant.Massless = false
+end
+end
+end
+
+clearPetState(uniqueId)
+clearPlayerState()
+pet.model:ScaleTo(1)
+mountedPet = nil
+end
+
+local function mount(uniqueId, playerState, petState)
+local pet = spawnerPets[uniqueId]
+if not pet or not pet.model then return end
+
+local player = LocalPlayer
+if not player.Character or not player.Character.PrimaryPart then return end
+
+mountedPet = uniqueId
+
+setPetState(uniqueId, petState)
+setPlayerState(playerState)
+
+pet.model:ScaleTo(2)
+attachPlayerToPet(pet.model)
+
+currentMountTrack = player.Character.Humanoid.Animator:LoadAnimation(
+animationManager.get_track('PlayerRidingPet')
+)
+player.Character.Humanoid.Sit = true
+
+for _, descendant in pairs(player.Character:GetDescendants()) do
+if descendant:IsA('BasePart') and descendant.Massless == false then
+descendant.Massless = true
+descendant:SetAttribute('HaveMass', true)
+end
+end
+
+currentMountTrack:Play()
+end
+
+local function fly(uniqueId)
+mount(uniqueId, 'PlayerFlyingPet', 'PetBeingFlown')
+end
+
+local function ride(uniqueId)
+mount(uniqueId, 'PlayerRidingPet', 'PetBeingRidden')
+end
+
+-- Only intercept pet equips
+local equipRemote = createRemoteFunctionMock(function(uniqueId, metadata)
+local pet = spawnerPets[uniqueId]
+
+if pet then
+_G.equipPet(pet.data)
+return true, { action = 'equip', is_server = true }
+end
+
+-- Forward non-pet equips to original handler
+return oldGet('ToolAPI/Equip'):InvokeServer(uniqueId, metadata)
+end)
+
+-- Only intercept pet unequips
+local unequipRemote = createRemoteFunctionMock(function(uniqueId)
+local pet = spawnerPets[uniqueId]
+
+if pet then
+_G.unequipPet(pet.data)
+return true, { action = 'unequip', is_server = true }
+end
+
+-- Forward non-pet unequips to original handler
+return oldGet('ToolAPI/Unequip'):InvokeServer(uniqueId)
+end)
+
+-- Pet riding/flying remotes
+local rideRemote = createRemoteFunctionMock(function(item)
+ride(item.pet_unique)
+end)
+
+local flyRemote = createRemoteFunctionMock(function(item)
+fly(item.pet_unique)
+end)
+
+local unmountRemoteFunction = createRemoteFunctionMock(function()
+unmount(mountedPet)
+end)
+
+local unmountRemoteEvent = createRemoteEventMock(function()
+unmount(mountedPet)
+end)
+
+router.get = function(name)
+-- Only intercept pet-related calls
+if name == 'ToolAPI/Equip' then
+return equipRemote
+elseif name == 'ToolAPI/Unequip' then
+return unequipRemote
+elseif name == 'AdoptAPI/RidePet' then
+return rideRemote
+elseif name == 'AdoptAPI/FlyPet' then
+return flyRemote
+elseif name == 'AdoptAPI/ExitSeatStatesYield' then
+return unmountRemoteFunction
+elseif name == 'AdoptAPI/ExitSeatStates' then
+return unmountRemoteEvent
+end
+
+-- Pass through all other requests
+return oldGet(name)
+end
+
+spawnerSystemLoaded = true
+end)
+
+if not success then
+warn("Error loading spawner system:", err)
+end
+end
+
+-- === MAIN GUI ===
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "PetDialogGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 180, 0, 250)
+mainFrame.Position = UDim2.new(0.5, -90, 0.5, -125)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+mainFrame.BackgroundTransparency = 0
+mainFrame.BorderSizePixel = 0
+mainFrame.ZIndex = 1
+mainFrame.Active = true
+mainFrame.Selectable = true
+mainFrame.Parent = screenGui
+
+local uiCorner = Instance.new("UICorner")
+uiCorner.CornerRadius = UDim.new(0, 10)
+uiCorner.Parent = mainFrame
+
+local uiStroke = Instance.new("UIStroke")
+uiStroke.Color = Color3.fromRGB(170, 0, 255)
+uiStroke.Thickness = 3
+uiStroke.Transparency = 0
+uiStroke.Parent = mainFrame
+
+local blackFrame = Instance.new("Frame")
+blackFrame.Size = UDim2.new(0, 190, 0, 260)
+blackFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+blackFrame.BackgroundTransparency = 0
+blackFrame.BorderSizePixel = 0
+blackFrame.ZIndex = 0
+blackFrame.Parent = screenGui
+
+local blackCorner = Instance.new("UICorner")
+blackCorner.CornerRadius = UDim.new(0, 12)
+blackCorner.Parent = blackFrame
+
+mainFrame:GetPropertyChangedSignal("Position"):Connect(function()
+blackFrame.Position = UDim2.new(
+mainFrame.Position.X.Scale,
+mainFrame.Position.X.Offset - 5,
+mainFrame.Position.Y.Scale,
+mainFrame.Position.Y.Offset - 5
+)
+end)
+
+blackFrame.Position = UDim2.new(
+mainFrame.Position.X.Scale,
+mainFrame.Position.X.Offset - 5,
+mainFrame.Position.Y.Scale,
+mainFrame.Position.Y.Offset - 5
+)
+
+-- === COLOR ANIMATION ===
+local colorPalette = {
+Color3.fromRGB(170, 0, 255), Color3.fromRGB(120, 0, 255),
+Color3.fromRGB(0, 100, 255), Color3.fromRGB(0, 200, 255),
+Color3.fromRGB(0, 255, 150), Color3.fromRGB(0, 255, 100),
+Color3.fromRGB(255, 100, 0), Color3.fromRGB(255, 50, 150)
+}
+
+local currentIndex = 1
+local function animateToNextColor()
+local nextIndex = currentIndex % #colorPalette + 1
+TweenService:Create(uiStroke, TweenInfo.new(4, Enum.EasingStyle.Linear), {
+Color = colorPalette[nextIndex]
+}):Play()
+currentIndex = nextIndex
+wait(4)
+animateToNextColor()
+end
+coroutine.wrap(animateToNextColor)()
+
+-- === GUI ELEMENTS ===
+local topLabel = Instance.new("TextLabel")
+topLabel.Size = UDim2.new(1, 0, 0, 20)
+topLabel.Position = UDim2.new(0, 0, 0, 5)
+topLabel.BackgroundTransparency = 1
+topLabel.Text = "liamadmz on discord"
+topLabel.Font = Enum.Font.FredokaOne
+topLabel.TextSize = 14
+topLabel.TextColor3 = Color3.fromRGB(240, 240, 255)
+topLabel.Parent = mainFrame
+
+local petNameLabel = Instance.new("TextLabel")
+petNameLabel.Size = UDim2.new(0.6, 0, 0, 12)
+petNameLabel.Position = UDim2.new(0.05, 0, 0.15, 0)
+petNameLabel.BackgroundTransparency = 1
+petNameLabel.Text = "Pet Name To Add"
+petNameLabel.Font = Enum.Font.FredokaOne
+petNameLabel.TextSize = 8
+petNameLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+petNameLabel.TextXAlignment = Enum.TextXAlignment.Left
+petNameLabel.Parent = mainFrame
+
+local petListBtn = Instance.new("TextButton")
+petListBtn.Size = UDim2.new(0.3, 0, 0, 12)
+petListBtn.Position = UDim2.new(0.65, 0, 0.15, 0)
+petListBtn.Text = "Pet list"
+petListBtn.Font = Enum.Font.FredokaOne
+petListBtn.TextSize = 8
+petListBtn.BackgroundColor3 = Color3.fromRGB(50, 40, 80)
+petListBtn.TextColor3 = Color3.fromRGB(215, 215, 255)
+petListBtn.AutoButtonColor = true
+petListBtn.Parent = mainFrame
+
+local uiCornerList = Instance.new("UICorner")
+uiCornerList.CornerRadius = UDim.new(0, 4)
+uiCornerList.Parent = petListBtn
+
+local petNameBox = Instance.new("TextBox")
+petNameBox.Size = UDim2.new(0.9, 0, 0, 20)
+petNameBox.Position = UDim2.new(0.05, 0, 0.22, 0)
+petNameBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+petNameBox.BackgroundTransparency = 0.2
+petNameBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+petNameBox.TextSize = 11
+petNameBox.Font = Enum.Font.FredokaOne
+petNameBox.PlaceholderText = "insert pet name"
+petNameBox.Text = ""
+petNameBox.ClearTextOnFocus = false
+petNameBox.Parent = mainFrame
+
+Instance.new("UICorner", petNameBox).CornerRadius = UDim.new(0, 6)
+
+local boxStroke = Instance.new("UIStroke", petNameBox)
+boxStroke.Color = Color3.new(0, 0, 0)
+boxStroke.Thickness = 1.2
+boxStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+
+local boxGlow = Instance.new("UIStroke", petNameBox)
+boxGlow.Color = Color3.fromRGB(255, 255, 255)
+boxGlow.Thickness = 2.2
+boxGlow.Transparency = 0.25
+boxGlow.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+-- === RANDOM PET BUTTON ===
+local randomPetBtn = Instance.new("TextButton")
+randomPetBtn.Size = UDim2.new(0.9, 0, 0, 18)
+randomPetBtn.Position = UDim2.new(0.05, 0, 0.36, 0)
+randomPetBtn.Text = "Pick Random Pet"
+randomPetBtn.Font = Enum.Font.FredokaOne
+randomPetBtn.TextSize = 10
+randomPetBtn.BackgroundColor3 = Color3.fromRGB(100, 50, 150)
+randomPetBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+randomPetBtn.AutoButtonColor = true
+randomPetBtn.Parent = mainFrame
+
+Instance.new("UICorner", randomPetBtn).CornerRadius = UDim.new(0, 6)
+
+-- === POTION BUTTONS ===
+local activeFlags = {F = false, R = false, N = false, M = false}
+local flagColors = {
+M = Color3.fromRGB(170, 0, 255),
+N = Color3.fromRGB(0, 255, 100),
+F = Color3.fromRGB(0, 200, 255),
+R = Color3.fromRGB(255, 50, 150)
+}
+
+local prefixes = {"F", "R", "N", "M"}
+
+for i, prefix in ipairs(prefixes) do
+local prefixButton = Instance.new("TextButton")
+prefixButton.Size = UDim2.new(0.18, 0, 0, 18)
+prefixButton.Position = UDim2.new(0.05 + (i-1)*0.23, 0, 0.48, 0)
+prefixButton.Text = prefix
+prefixButton.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+prefixButton.BackgroundTransparency = 0.2
+prefixButton.Font = Enum.Font.FredokaOne
+prefixButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+prefixButton.TextSize = 12
+prefixButton.AutoButtonColor = true
+prefixButton.Parent = mainFrame
+
+Instance.new("UICorner", prefixButton).CornerRadius = UDim.new(0, 6)
+
+local buttonStroke = Instance.new("UIStroke", prefixButton)
+buttonStroke.Color = flagColors[prefix]
+buttonStroke.Thickness = 2
+buttonStroke.Transparency = 0.5
+buttonStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+local textStroke = Instance.new("UIStroke", prefixButton)
+textStroke.Color = Color3.new(0, 0, 0)
+textStroke.Thickness = 1.5
+textStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual
+
+local originalStroke = {
+Color = flagColors[prefix],
+Thickness = 2,
+Transparency = 0.5
+}
+
+prefixButton.MouseButton1Click:Connect(function()
+if prefix == "M" and activeFlags["N"] then return end
+if prefix == "N" and activeFlags["M"] then return end
+
+activeFlags[prefix] = not activeFlags[prefix]
+
+if activeFlags[prefix] then
+prefixButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+TweenService:Create(buttonStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+Color = Color3.fromRGB(0, 255, 0),
+Thickness = 3,
+Transparency = 0.2
+}):Play()
+else
+prefixButton.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+TweenService:Create(buttonStroke, TweenInfo.new(0.3, Enum.EasingStyle.Quad), {
+Color = originalStroke.Color,
+Thickness = originalStroke.Thickness,
+Transparency = originalStroke.Transparency
+}):Play()
+end
+end)
+end
+
+-- === INFO BOX ===
+local infoBox = Instance.new("Frame")
+infoBox.Size = UDim2.new(0.9, 0, 0, 22)
+infoBox.Position = UDim2.new(0.05, 0, 0.62, 0)
+infoBox.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+infoBox.BackgroundTransparency = 0.5
+infoBox.Parent = mainFrame
+
+Instance.new("UICorner", infoBox).CornerRadius = UDim.new(0, 6)
+
+local infoBoxStroke = Instance.new("UIStroke", infoBox)
+infoBoxStroke.Color = Color3.fromRGB(255, 255, 255)
+infoBoxStroke.Thickness = 1.2
+infoBoxStroke.Transparency = 0.7
+
+local infoTextContainer = Instance.new("Frame", infoBox)
+infoTextContainer.Size = UDim2.new(1, 0, 1, 0)
+infoTextContainer.BackgroundTransparency = 1
+
+local uiListLayout = Instance.new("UIListLayout", infoTextContainer)
+uiListLayout.FillDirection = Enum.FillDirection.Horizontal
+uiListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+uiListLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+uiListLayout.Padding = UDim.new(0, 4)
+
+-- === INFO BOX UPDATE FUNCTION ===
+local function updateInfoBox()
+for _, child in ipairs(infoTextContainer:GetChildren()) do
+if child:IsA("TextLabel") then
+child:Destroy()
+end
+end
+
+if activeFlags["M"] then
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 0, 1, 0)
+label.AutomaticSize = Enum.AutomaticSize.X
+label.BackgroundTransparency = 1
+label.Text = "Mega Neon"
+label.Font = Enum.Font.FredokaOne
+label.TextSize = 10
+label.TextColor3 = flagColors.M
+label.Parent = infoTextContainer
+elseif activeFlags["N"] then
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 0, 1, 0)
+label.AutomaticSize = Enum.AutomaticSize.X
+label.BackgroundTransparency = 1
+label.Text = "Neon"
+label.Font = Enum.Font.FredokaOne
+label.TextSize = 10
+label.TextColor3 = flagColors.N
+label.Parent = infoTextContainer
+end
+
+if activeFlags["F"] then
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 0, 1, 0)
+label.AutomaticSize = Enum.AutomaticSize.X
+label.BackgroundTransparency = 1
+label.Text = activeFlags["N"] or activeFlags["M"] and " Fly" or "Fly"
+label.Font = Enum.Font.FredokaOne
+label.TextSize = 10
+label.TextColor3 = flagColors.F
+label.Parent = infoTextContainer
+end
+
+if activeFlags["R"] then
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 0, 1, 0)
+label.AutomaticSize = Enum.AutomaticSize.X
+label.BackgroundTransparency = 1
+label.Text = (activeFlags["N"] or activeFlags["M"] or activeFlags["F"]) and " Ride" or "Ride"
+label.Font = Enum.Font.FredokaOne
+label.TextSize = 10
+label.TextColor3 = flagColors.R
+label.Parent = infoTextContainer
+end
+
+if not (activeFlags["M"] or activeFlags["N"] or activeFlags["F"] or activeFlags["R"]) then
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 0, 1, 0)
+label.AutomaticSize = Enum.AutomaticSize.X
+label.BackgroundTransparency = 1
+label.Text = "Normal"
+label.Font = Enum.Font.FredokaOne
+label.TextSize = 10
+label.TextColor3 = Color3.fromRGB(255, 255, 255)
+label.Parent = infoTextContainer
+infoBoxStroke.Color = Color3.fromRGB(255, 255, 255)
+infoBoxStroke.Thickness = 1.2
+infoBoxStroke.Transparency = 0.7
+end
+end
+
+-- Initialize info box
+updateInfoBox()
+
+-- === SHOW DIALOG BUTTON ===
+local dialogBtn = Instance.new("TextButton")
+dialogBtn.Size = UDim2.new(0.9, 0, 0, 20)
+dialogBtn.Position = UDim2.new(0.05, 0, 0.75, 0)
+dialogBtn.Text = "Show the dialog"
+dialogBtn.Font = Enum.Font.FredokaOne
+dialogBtn.TextSize = 11
+dialogBtn.BackgroundColor3 = Color3.fromRGB(30, 105, 210)
+dialogBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+dialogBtn.AutoButtonColor = true
+dialogBtn.Parent = mainFrame
+
+Instance.new("UICorner", dialogBtn).CornerRadius = UDim.new(0, 6)
+
+-- === PET LIST POPUP ===
+local petListFrame = Instance.new("Frame")
+petListFrame.Size = UDim2.new(0, 200, 0, 220)
+petListFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+petListFrame.Visible = false
+petListFrame.ZIndex = 100
+petListFrame.Parent = screenGui
+
+Instance.new("UICorner", petListFrame).CornerRadius = UDim.new(0, 8)
+
+local petListStroke = Instance.new("UIStroke", petListFrame)
+petListStroke.Color = Color3.fromRGB(110, 0, 255)
+petListStroke.Thickness = 2
+petListStroke.Parent = petListFrame
+
+local petListScroll = Instance.new("ScrollingFrame")
+petListScroll.Size = UDim2.new(1, -10, 1, -10)
+petListScroll.Position = UDim2.new(0, 5, 0, 5)
+petListScroll.BackgroundTransparency = 1
+petListScroll.ScrollBarThickness = 6
+petListScroll.CanvasSize = UDim2.new(0, 0, 0, #petNames * 20 + 10)
+petListScroll.BorderSizePixel = 0
+petListScroll.ZIndex = 101
+petListScroll.Parent = petListFrame
+
+local petListLayout = Instance.new("UIListLayout")
+petListLayout.Padding = UDim.new(0, 2)
+petListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+petListLayout.Parent = petListScroll
+
+for i, pet in ipairs(petNames) do
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(1, -10, 0, 18)
+btn.Text = pet
+btn.Font = Enum.Font.FredokaOne
+btn.TextSize = 10
+btn.BackgroundColor3 = Color3.fromRGB(50, 40, 80)
+btn.TextColor3 = Color3.fromRGB(215, 215, 255)
+btn.LayoutOrder = i
+btn.BorderSizePixel = 0
+btn.TextXAlignment = Enum.TextXAlignment.Left
+btn.TextTruncate = Enum.TextTruncate.None
+btn.AutoButtonColor = true
+btn.ZIndex = 102
+btn.Parent = petListScroll
+
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+local textPadding = Instance.new("UIPadding")
+textPadding.PaddingLeft = UDim.new(0, 5)
+textPadding.PaddingRight = UDim.new(0, 5)
+textPadding.Parent = btn
+
+btn.MouseButton1Click:Connect(function()
+petNameBox.Text = pet
+petListFrame.Visible = false
+end)
+end
+
+local function updatePetListPosition()
+if petListFrame.Visible then
+local mfPos = mainFrame.AbsolutePosition
+local mfSize = mainFrame.AbsoluteSize
+petListFrame.Position = UDim2.new(0, mfPos.X + mfSize.X + 5, 0, mfPos.Y)
+end
+end
+
+petListBtn.MouseButton1Click:Connect(function()
+petListFrame.Visible = not petListFrame.Visible
+if petListFrame.Visible then
+updatePetListPosition()
+end
+end)
+
+mainFrame:GetPropertyChangedSignal("Position"):Connect(function()
+if petListFrame.Visible then
+updatePetListPosition()
+end
+end)
+
+-- === RANDOM PET FUNCTION ===
+randomPetBtn.MouseButton1Click:Connect(function()
+local randomIndex = math.random(1, #petNames)
+local randomPet = petNames[randomIndex]
+petNameBox.Text = randomPet
+
+local randomOption = math.random(1, 3)
+
+for _, prefix in ipairs(prefixes) do
+activeFlags[prefix] = false
+end
+
+if randomOption == 1 then
+activeFlags["M"] = true
+elseif randomOption == 2 then
+activeFlags["N"] = true
+end
+
+updateInfoBox()
+end)
+
+-- === FIXED DIALOG FUNCTION ===
+local function showPetDialog()
+local selectedPet = petNameBox.Text
+if selectedPet == "" or selectedPet == "insert pet name" then
+return
+end
+
+-- Load spawner system if not loaded
+if not spawnerSystemLoaded then
+loadSpawnerSystem()
+wait(0.5) -- Give time to load
+end
+
+-- Use game's DialogApp with proper thread identity
+local oldIdentity = set_thread_identity(2)
+
+local success, result = pcall(function()
+local Fsys = require(ReplicatedStorage:WaitForChild('Fsys'))
+local load = Fsys.load
+
+-- Get pet ID
+local petId
+if _G.GetPetByName then
+petId = _G.GetPetByName(selectedPet)
+else
+local InventoryDB = load('InventoryDB')
+for id, pet in pairs(InventoryDB.pets) do
+if pet.name:lower() == selectedPet:lower() then
+petId = id
+break
+end
+end
+end
+
+if not petId then
+return false
+end
+
+local items = load('KindDB')
+local petItemData = items[petId]
+
+local petProperties = {
+pet_trick_level = math.random(1, 5),
+neon = activeFlags["N"],
+mega_neon = activeFlags["M"],
+rideable = activeFlags["R"],
+flyable = activeFlags["F"],
+age = math.random(1, 900000),
+ailments_completed = 0,
+rp_name = ""
+}
+
+-- Use game's dialog system
+local UIManager = load('UIManager')
+local DialogApp = UIManager.apps.DialogApp
+
+if DialogApp and DialogApp.dialog then
+local response = DialogApp:dialog({
+dialog_type = "ItemPreviewDialog",
+text = "An Adopt Me admin gave you: " .. selectedPet,
+item = {
+id = petId,
+name = selectedPet,
+category = "pets",
+kind = petItemData and petItemData.kind or "",
+properties = petProperties
+},
+button = "Okay!",
+yields = true
+})
+
+if response == "Okay!" and _G.createPet then
+_G.createPet(petId, petProperties)
+return true
+end
+end
+
+return false
+end)
+
+set_thread_identity(oldIdentity)
+
+-- If game dialog failed, show simple message
+if not success or not result then
+-- Simple success message
+local messageGui = Instance.new("ScreenGui")
+messageGui.Name = "SuccessMessage"
+messageGui.ResetOnSpawn = false
+messageGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 200, 0, 100)
+frame.Position = UDim2.new(0.5, -100, 0.5, -50)
+frame.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+frame.BackgroundTransparency = 0.1
+frame.Parent = messageGui
+
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0.9, 0, 0.6, 0)
+label.Position = UDim2.new(0.05, 0, 0.1, 0)
+label.Text = "Pet Spawned: " .. selectedPet
+label.Font = Enum.Font.FredokaOne
+label.TextSize = 14
+label.TextColor3 = Color3.fromRGB(255, 255, 255)
+label.BackgroundTransparency = 1
+label.Parent = frame
+
+local okButton = Instance.new("TextButton")
+okButton.Size = UDim2.new(0.6, 0, 0.25, 0)
+okButton.Position = UDim2.new(0.2, 0, 0.65, 0)
+okButton.Text = "Okay!"
+okButton.Font = Enum.Font.FredokaOne
+okButton.TextSize = 12
+okButton.BackgroundColor3 = Color3.fromRGB(30, 105, 210)
+okButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+okButton.AutoButtonColor = true
+okButton.Parent = frame
+
+Instance.new("UICorner", okButton).CornerRadius = UDim.new(0, 6)
+
+okButton.MouseButton1Click:Connect(function()
+messageGui:Destroy()
+if _G.createPet then
+local oldId = set_thread_identity(2)
+local InventoryDB = require(ReplicatedStorage:WaitForChild('Fsys')).load('InventoryDB')
+local petId
+for id, pet in pairs(InventoryDB.pets) do
+if pet.name:lower() == selectedPet:lower() then
+petId = id
+break
+end
+end
+
+if petId then
+local petProperties = {
+pet_trick_level = math.random(1, 5),
+neon = activeFlags["N"],
+mega_neon = activeFlags["M"],
+rideable = activeFlags["R"],
+flyable = activeFlags["F"],
+age = math.random(1, 900000),
+ailments_completed = 0,
+rp_name = ""
+}
+_G.createPet(petId, petProperties)
+end
+set_thread_identity(oldId)
+end
+end)
+
+-- Auto-remove after 5 seconds
+task.delay(5, function()
+if messageGui then
+messageGui:Destroy()
+end
+end)
+end
+end
+
+dialogBtn.MouseButton1Click:Connect(showPetDialog)
+
+-- === DRAGGABLE GUI ===
+local dragging, dragStart, startPos
+
+mainFrame.InputBegan:Connect(function(input)
+if input.UserInputType == Enum.UserInputType.MouseButton1 or 
+input.UserInputType == Enum.UserInputType.Touch then
+dragging = true
+dragStart = input.Position
+startPos = mainFrame.Position
+
+input.Changed:Connect(function()
+if input.UserInputState == Enum.UserInputState.End then
+dragging = false
+end
+end)
+end
+end)
+
+mainFrame.InputChanged:Connect(function(input)
+if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or 
+input.UserInputType == Enum.UserInputType.Touch) then
+local delta = input.Position - dragStart
+mainFrame.Position = UDim2.new(
+startPos.X.Scale,
+startPos.X.Offset + delta.X,
+startPos.Y.Scale,
+startPos.Y.Offset + delta.Y
+)
+end
+end)
+
+-- Close pet list when clicking outside
+UserInputService.InputBegan:Connect(function(input)
+if input.UserInputType == Enum.UserInputType.MouseButton1 and petListFrame.Visible then
+local mousePos = input.Position
+local listAbsPos = petListFrame.AbsolutePosition
+local listSize = petListFrame.AbsoluteSize
+local mainAbsPos = mainFrame.AbsolutePosition
+local mainSize = mainFrame.AbsoluteSize
+
+local isInPetList = (mousePos.X >= listAbsPos.X and mousePos.X <= listAbsPos.X + listSize.X and
+mousePos.Y >= listAbsPos.Y and mousePos.Y <= listAbsPos.Y + listSize.Y)
+
+local isInMainFrame = (mousePos.X >= mainAbsPos.X and mousePos.X <= mainAbsPos.X + mainSize.X and
+mousePos.Y >= mainAbsPos.Y and mousePos.Y <= mainAbsPos.Y + mainSize.Y)
+
+if not isInPetList and not isInMainFrame then
+petListFrame.Visible = false
+end
+end
+end)
+
+-- Auto-start spawner system
+task.spawn(function()
+wait(1)
+loadSpawnerSystem()
+end)
